@@ -274,7 +274,7 @@ impl<T: PartialEq + Debug + Clone, M: Merge<Item = T>> MerkleProof<T, M> {
     }
 }
 
-fn calculate_peak_root<
+pub(crate) fn calculate_peak_root<
     'a,
     T: 'a + PartialEq + Debug + Clone,
     M: Merge<Item = T>,
@@ -385,7 +385,7 @@ fn calculate_peaks_hashes<
     Ok(peaks_hashes)
 }
 
-fn bagging_peaks_hashes<'a, T: 'a + PartialEq + Debug + Clone, M: Merge<Item = T>>(
+pub(crate) fn bagging_peaks_hashes<'a, T: 'a + PartialEq + Debug + Clone, M: Merge<Item = T>>(
     mut peaks_hashes: Vec<T>,
 ) -> Result<T> {
     // bagging peaks
