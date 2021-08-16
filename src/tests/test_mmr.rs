@@ -5,6 +5,7 @@ use crate::{leaf_index_to_mmr_size, leaf_index_to_pos, util::MemStore, Error, Me
 use faster_hex::hex_string;
 use proptest::prelude::*;
 use rand::{seq::SliceRandom, thread_rng};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 struct SimplifiedProof {
@@ -14,6 +15,65 @@ struct SimplifiedProof {
     mmr_right_bagged_peak: Option<NumberHash>,
     rest_of_the_peaks: Vec<NumberHash>,
     mmr_root: NumberHash,
+}
+
+impl SimplifiedProof {
+    fn convert_to_go_proof(&self) -> SimplifiedProofGo {
+        SimplifiedProofGo {
+            merkle_proof_items: self
+                .merkle_proof_items
+                .clone()
+                .iter()
+                .map(|x| x.0.to_vec())
+                .collect(),
+            merkle_proof_order: self.merkle_proof_order.clone(),
+            leave: self.leave.clone().0.to_vec(),
+            has_right_bagged_peak: self.mmr_right_bagged_peak.is_some(),
+            mmr_right_bagged_peak: self
+                .mmr_right_bagged_peak
+                .clone()
+                .and_then(|x| Some(x.0.to_vec()))
+                .unwrap_or([0u8; 32].to_vec()),
+            mmr_rest_of_the_peaks: self
+                .rest_of_the_peaks
+                .clone()
+                .iter()
+                .map(|x| x.0.to_vec())
+                .collect(),
+        }
+    }
+}
+
+/// Only used to generate go test data
+#[derive(Serialize, Deserialize)]
+struct SimplifiedProofGo {
+    #[serde(rename = "MerkleProofItems")]
+    merkle_proof_items: Vec<Vec<u8>>,
+    #[serde(rename = "MerkleProofOrder")]
+    merkle_proof_order: Vec<bool>,
+    #[serde(rename = "Leave")]
+    leave: Vec<u8>,
+    #[serde(rename = "HasRightBaggedPeak")]
+    has_right_bagged_peak: bool,
+    #[serde(rename = "MMRRightBaggedPeak")]
+    mmr_right_bagged_peak: Vec<u8>,
+    #[serde(rename = "MMRRestOfThePeaks")]
+    mmr_rest_of_the_peaks: Vec<Vec<u8>>,
+}
+
+/// Only used to generate go test data
+#[derive(Serialize, Deserialize)]
+struct SimplifiedProofTestGo {
+    #[serde(rename = "ReferenceSimplifiedProof")]
+    reference_simplified_proof: SimplifiedProofGo,
+    #[serde(rename = "LeafHash")]
+    leaf_hash: Vec<u8>,
+    #[serde(rename = "LeafIndex")]
+    leaf_index: u64,
+    #[serde(rename = "LeafCount")]
+    leaf_count: u64,
+    #[serde(rename = "MMRProof")]
+    mmr_proof: Vec<Vec<u8>>,
 }
 
 /// Simple Merkle root calculation in Solidity
@@ -258,8 +318,9 @@ fn verify_simplified_proof(simplified_proof: SimplifiedProof) {
     }
 }
 
-fn test_mmr_simplified(count: u32) -> bool {
+fn test_mmr_simplified(count: u32) -> Vec<SimplifiedProofTestGo> {
     let peaks = get_peaks(leaf_index_to_mmr_size(count as u64 - 1));
+    let mut simplified_proof_test_data = vec![];
     println!("Peaks: {:?}", peaks);
     let store = MemStore::default();
     let mut mmr = MMR::<_, MergeNumberHash, _>::new(0, &store);
@@ -281,18 +342,36 @@ fn test_mmr_simplified(count: u32) -> bool {
             proof.proof_items().to_vec(),
             (leaf_index_to_pos(i as u64), i.into()),
         );
+
+        let simplified_proof_in_go = simplified_proof.convert_to_go_proof();
+        simplified_proof_test_data.push(SimplifiedProofTestGo {
+            reference_simplified_proof: simplified_proof_in_go,
+            leaf_hash: NumberHash::from(i).0.to_vec(),
+            leaf_index: i as u64,
+            leaf_count: count as u64,
+            mmr_proof: proof
+                .proof_items()
+                .clone()
+                .iter()
+                .map(|x| x.0.to_vec())
+                .collect(),
+        });
+
         verify_simplified_proof(simplified_proof);
     }
 
-    true
+    simplified_proof_test_data
 }
 
 #[test]
 fn test_simplified_mmr() {
-    test_mmr_simplified(1);
-    test_mmr_simplified(2);
-    test_mmr_simplified(5);
-    test_mmr_simplified(15);
+    let mut go_test_data = test_mmr_simplified(1);
+    go_test_data.extend(test_mmr_simplified(2));
+    go_test_data.extend(test_mmr_simplified(5));
+    go_test_data.extend(test_mmr_simplified(15));
+
+    println!("Reference test data");
+    println!("{}", serde_json::to_string(&go_test_data).unwrap());
 
     // Heavy test. Uncomment if you want to test the simplified mmr thoroughly
     //for i in 0u32..100 {
