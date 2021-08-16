@@ -369,6 +369,7 @@ fn test_simplified_mmr() {
     go_test_data.extend(test_mmr_simplified(2));
     go_test_data.extend(test_mmr_simplified(5));
     go_test_data.extend(test_mmr_simplified(15));
+    go_test_data.extend(test_mmr_simplified(60));
 
     println!("Reference test data");
     println!("{}", serde_json::to_string(&go_test_data).unwrap());
