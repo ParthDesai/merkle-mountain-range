@@ -1,4 +1,4 @@
-use super::{MergeNumberHash, NumberHash};
+use super::{NumberHash};
 use crate::helper::{get_peaks, parent_offset, pos_height_in_tree, sibling_offset};
 use crate::mmr::{bagging_peaks_hashes, calculate_peak_root};
 use crate::{leaf_index_to_mmr_size, leaf_index_to_pos, util::MemStore, Error, Merge, MMR};
@@ -7,6 +7,7 @@ use proptest::prelude::*;
 use rand::{seq::SliceRandom, thread_rng};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use sha3::{Keccak256, Digest};
 
 struct SimplifiedProof {
     merkle_proof_items: Vec<NumberHash>,
@@ -66,6 +67,8 @@ struct SimplifiedProofGo {
 struct SimplifiedProofTestGo {
     #[serde(rename = "ReferenceSimplifiedProof")]
     reference_simplified_proof: SimplifiedProofGo,
+    #[serde(rename = "ReferenceMMRRoot")]
+    reference_mmr_root: Vec<u8>,
     #[serde(rename = "LeafHash")]
     leaf_hash: Vec<u8>,
     #[serde(rename = "LeafIndex")]
@@ -74,6 +77,15 @@ struct SimplifiedProofTestGo {
     leaf_count: u64,
     #[serde(rename = "MMRProof")]
     mmr_proof: Vec<Vec<u8>>,
+}
+
+struct MergeNumberHash;
+
+impl Merge for MergeNumberHash {
+    type Item = NumberHash;
+    fn merge(lhs: &Self::Item, rhs: &Self::Item) -> Self::Item {
+        NumberHash(Keccak256::new().chain(&lhs.0).chain(&rhs.0).finalize().to_vec().into())
+    }
 }
 
 /// Simple Merkle root calculation in Solidity
@@ -123,6 +135,12 @@ fn calculate_merkle_root_in_go(
     queue.push_back((0, leave.0, leave.1));
 
     while let Some((height, pos, hash)) = queue.pop_front() {
+        let potential_sibling_hash = proof_items_iter.next();
+        if potential_sibling_hash.is_none() {
+            // We have reached the end
+            return (hash, proof_order);
+        }
+
         let next_height = pos_height_in_tree(pos + 1);
         let (is_sibling_left, sibling_height, sibling_pos) = if next_height > height {
             // Sibling is left
@@ -133,12 +151,6 @@ fn calculate_merkle_root_in_go(
             proof_order.push(false);
             (false, height, pos + sibling_offset(height))
         };
-
-        let potential_sibling_hash = proof_items_iter.next();
-        if potential_sibling_hash.is_none() {
-            // We have reached the end
-            return (hash, proof_order);
-        }
 
         let sibling = (sibling_height, sibling_pos, potential_sibling_hash.unwrap());
 
@@ -349,6 +361,7 @@ fn test_mmr_simplified(count: u32) -> Vec<SimplifiedProofTestGo> {
             leaf_hash: NumberHash::from(i).0.to_vec(),
             leaf_index: i as u64,
             leaf_count: count as u64,
+            reference_mmr_root: root.0.to_vec(),
             mmr_proof: proof
                 .proof_items()
                 .clone()
@@ -365,6 +378,10 @@ fn test_mmr_simplified(count: u32) -> Vec<SimplifiedProofTestGo> {
 
 #[test]
 fn test_simplified_mmr() {
+    // 5 peaks example: [30, 45, 52, 55, 56]
+    // 6 peaks example: [62, 93, 108, 115, 118, 119]
+    // 7 peaks example: [126, 189, 220, 235, 242, 245, 246]
+
     let mut go_test_data = test_mmr_simplified(1);
     go_test_data.extend(test_mmr_simplified(2));
     go_test_data.extend(test_mmr_simplified(5));
