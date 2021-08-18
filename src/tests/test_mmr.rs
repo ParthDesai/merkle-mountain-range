@@ -11,7 +11,7 @@ use sha3::{Keccak256, Digest};
 
 struct SimplifiedProof {
     merkle_proof_items: Vec<NumberHash>,
-    merkle_proof_order: Vec<bool>,
+    merkle_proof_order: u64,
     leave: NumberHash,
     mmr_right_bagged_peak: Option<NumberHash>,
     rest_of_the_peaks: Vec<NumberHash>,
@@ -27,7 +27,7 @@ impl SimplifiedProof {
                 .iter()
                 .map(|x| x.0.to_vec())
                 .collect(),
-            merkle_proof_order: self.merkle_proof_order.clone(),
+            merkle_proof_order: self.merkle_proof_order,
             leave: self.leave.clone().0.to_vec(),
             has_right_bagged_peak: self.mmr_right_bagged_peak.is_some(),
             mmr_right_bagged_peak: self
@@ -51,7 +51,7 @@ struct SimplifiedProofGo {
     #[serde(rename = "MerkleProofItems")]
     merkle_proof_items: Vec<Vec<u8>>,
     #[serde(rename = "MerkleProofOrder")]
-    merkle_proof_order: Vec<bool>,
+    merkle_proof_order: u64,
     #[serde(rename = "Leave")]
     leave: Vec<u8>,
     #[serde(rename = "HasRightBaggedPeak")]
@@ -92,12 +92,13 @@ impl Merge for MergeNumberHash {
 fn calculate_merkle_root_in_solidity(
     leave: NumberHash,
     proof_items: Vec<NumberHash>,
-    proof_order: Vec<bool>,
+    proof_order: u64,
 ) -> NumberHash {
     let mut proof_items_iter = proof_items.iter();
-    let mut proof_order_iter = proof_order.iter();
     let mut queue: VecDeque<NumberHash> = VecDeque::new();
     queue.push_back(leave);
+
+    let mut bit_field_position = 0;
 
     while let Some(hash) = queue.pop_front() {
         let potential_sibling_hash = proof_items_iter.next();
@@ -106,10 +107,12 @@ fn calculate_merkle_root_in_solidity(
             return hash;
         }
 
-        let is_left = proof_order_iter.next().unwrap();
+        let is_left = (proof_order >> bit_field_position & 1) == 1;
+        bit_field_position += 1;
+
         let sibling = potential_sibling_hash.unwrap();
 
-        let parent_hash = if *is_left {
+        let parent_hash = if is_left {
             MergeNumberHash::merge(sibling, &hash)
         } else {
             MergeNumberHash::merge(&hash, sibling)
@@ -128,9 +131,10 @@ fn calculate_merkle_root_in_solidity(
 fn calculate_merkle_root_in_go(
     leave: (u64, NumberHash),
     proof_items: Vec<NumberHash>,
-) -> (NumberHash, Vec<bool>) {
+) -> (NumberHash, u64) {
     let mut proof_items_iter = proof_items.iter();
-    let mut proof_order = vec![];
+    let mut proof_order = 0;
+    let mut proof_order_bit_field_position = 0;
     let mut queue: VecDeque<(u32, u64, NumberHash)> = VecDeque::new();
     queue.push_back((0, leave.0, leave.1));
 
@@ -144,13 +148,13 @@ fn calculate_merkle_root_in_go(
         let next_height = pos_height_in_tree(pos + 1);
         let (is_sibling_left, sibling_height, sibling_pos) = if next_height > height {
             // Sibling is left
-            proof_order.push(true);
+            proof_order = proof_order | 1 << proof_order_bit_field_position;
             (true, height, pos - sibling_offset(height))
         } else {
             // Sibling is right
-            proof_order.push(false);
             (false, height, pos + sibling_offset(height))
         };
+        proof_order_bit_field_position += 1;
 
         let sibling = (sibling_height, sibling_pos, potential_sibling_hash.unwrap());
 
@@ -274,7 +278,7 @@ fn convert_to_simplified_proof(
         let merkle_root_solidity = calculate_merkle_root_in_solidity(
             leave.1.clone(),
             merkle_proof.clone(),
-            proof_order.clone(),
+            proof_order,
         );
         assert_eq!(reference, merkle_root);
         assert_eq!(reference, merkle_root_mmr_based);
