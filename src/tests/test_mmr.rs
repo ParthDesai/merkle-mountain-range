@@ -1,13 +1,15 @@
 use super::{NumberHash};
 use crate::helper::{get_peaks, parent_offset, pos_height_in_tree, sibling_offset};
 use crate::mmr::{bagging_peaks_hashes, calculate_peak_root};
-use crate::{leaf_index_to_mmr_size, leaf_index_to_pos, util::MemStore, Error, Merge, MMR};
-use faster_hex::hex_string;
+use crate::{leaf_index_to_mmr_size, leaf_index_to_pos, util::MemStore, Error, Merge, MMR, MerkleProof};
+use faster_hex::{hex_string, hex_decode};
 use proptest::prelude::*;
 use rand::{seq::SliceRandom, thread_rng};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use sha3::{Keccak256, Digest};
+use bytes::Bytes;
+use hex::{decode, encode};
 
 struct SimplifiedProof {
     merkle_proof_items: Vec<NumberHash>,
@@ -16,6 +18,8 @@ struct SimplifiedProof {
     mmr_right_bagged_peak: Option<NumberHash>,
     rest_of_the_peaks: Vec<NumberHash>,
     mmr_root: NumberHash,
+    simplified_merkle_proof_items: Vec<NumberHash>,
+    simplified_merkle_proof_order: u64
 }
 
 impl SimplifiedProof {
@@ -41,6 +45,8 @@ impl SimplifiedProof {
                 .iter()
                 .map(|x| x.0.to_vec())
                 .collect(),
+            simplified_merkle_proof_order: self.simplified_merkle_proof_order,
+            simplified_merkle_proof_items: self.simplified_merkle_proof_items.clone().iter().map(|x| x.0.to_vec()).collect()
         }
     }
 }
@@ -60,6 +66,10 @@ struct SimplifiedProofGo {
     mmr_right_bagged_peak: Vec<u8>,
     #[serde(rename = "MMRRestOfThePeaks")]
     mmr_rest_of_the_peaks: Vec<Vec<u8>>,
+    #[serde(skip)]
+    simplified_merkle_proof_items: Vec<Vec<u8>>,
+    #[serde(skip)]
+    simplified_merkle_proof_order: u64,
 }
 
 /// Only used to generate go test data
@@ -77,6 +87,10 @@ struct SimplifiedProofTestGo {
     leaf_count: u64,
     #[serde(rename = "MMRProof")]
     mmr_proof: Vec<Vec<u8>>,
+    #[serde(rename = "SimplifiedMerkleProofItems")]
+    simplified_merkle_proof_items: Vec<Vec<u8>>,
+    #[serde(rename = "SimplifiedMerkleProofOrder")]
+    simplified_merkle_proof_order: u64,
 }
 
 struct MergeNumberHash;
@@ -113,10 +127,14 @@ fn calculate_merkle_root_in_solidity(
         let sibling = potential_sibling_hash.unwrap();
 
         let parent_hash = if is_left {
+            println!("Left merging: {:?} {:?}", hex_string(&hash.0.to_vec()).unwrap(), hex_string(&sibling.0.to_vec()).unwrap());
             MergeNumberHash::merge(sibling, &hash)
         } else {
+            println!("Right merging: {:?} {:?}", hex_string(&hash.0.to_vec()).unwrap(), hex_string(&sibling.0.to_vec()).unwrap());
             MergeNumberHash::merge(&hash, sibling)
         };
+
+        println!("Parent hash: {:?}", hex_string(&parent_hash.0.to_vec()).unwrap());
 
         queue.push_back(parent_hash);
     }
@@ -265,6 +283,9 @@ fn convert_to_simplified_proof(
         merkle_proof.clone(),
     );
 
+    let mut simplified_mmr_proof_items = vec![];
+    let mut simplified_mmr_proof_order: u64 = 0;
+
     {
         // This checks are only for sanity check and will not be a part of actual algorithm
         let merkle_root_mmr_based =
@@ -295,7 +316,30 @@ fn convert_to_simplified_proof(
 
         let calculated_mmr_root = bagging_peaks_hashes::<_, MergeNumberHash>(traditional_peaks)
             .expect("mmr root calculation should not fail");
-        assert_eq!(calculated_mmr_root, root);
+        println!("Calculated: {:?}", hex_string(&*calculated_mmr_root.0.to_vec()).unwrap());
+        println!("Reference: {:?}", hex_string(&*root.0.to_vec()).unwrap());
+        //assert_eq!(calculated_mmr_root, root);
+
+        for mproof in &merkle_proof {
+            simplified_mmr_proof_items.push(mproof.clone());
+        }
+        simplified_mmr_proof_order = proof_order;
+        let mut proof_bit_position = if simplified_mmr_proof_items.len() == 0 {
+            0
+        } else {
+            simplified_mmr_proof_items.len() - 1
+        };
+        if right_bagged_peak.is_some() {
+            proof_bit_position += 1;
+            simplified_mmr_proof_order = simplified_mmr_proof_order | 1 << proof_bit_position;
+            simplified_mmr_proof_items.push(right_bagged_peak.clone().unwrap());
+        }
+        for i in 0..readymade_peak_hashes.len() {
+            simplified_mmr_proof_items.push(readymade_peak_hashes[readymade_peak_hashes.len() - i - 1].clone());
+        }
+
+        let simplified_root = calculate_merkle_root_in_solidity(leave.1.clone(), simplified_mmr_proof_items.clone(), simplified_mmr_proof_order);
+        assert_eq!(calculated_mmr_root, simplified_root);
     }
 
     SimplifiedProof {
@@ -305,10 +349,12 @@ fn convert_to_simplified_proof(
         rest_of_the_peaks: readymade_peak_hashes,
         mmr_root: root,
         mmr_right_bagged_peak: right_bagged_peak,
+        simplified_merkle_proof_items: simplified_mmr_proof_items,
+        simplified_merkle_proof_order: simplified_mmr_proof_order
     }
 }
 
-fn verify_simplified_proof(simplified_proof: SimplifiedProof) {
+fn is_valid_simplified_proof(simplified_proof: SimplifiedProof) -> bool {
     let mut peaks = vec![];
     for peak in &simplified_proof.rest_of_the_peaks {
         peaks.push(peak.clone());
@@ -322,7 +368,9 @@ fn verify_simplified_proof(simplified_proof: SimplifiedProof) {
     peaks.push(merkle_root.clone());
 
     if peaks.is_empty() {
-        assert_eq!(merkle_root, simplified_proof.mmr_root.clone());
+        if !merkle_root.eq(&simplified_proof.mmr_root.clone()) {
+            return false;
+        }
     } else {
         if simplified_proof.mmr_right_bagged_peak.is_some() {
             let last_peak_hash = simplified_proof.mmr_right_bagged_peak.unwrap();
@@ -330,20 +378,90 @@ fn verify_simplified_proof(simplified_proof: SimplifiedProof) {
         }
         let caclulated_mmr_root = bagging_peaks_hashes::<_, MergeNumberHash>(peaks)
             .expect("Bagging should be successful");
-        assert_eq!(caclulated_mmr_root, simplified_proof.mmr_root);
+        if !caclulated_mmr_root.eq(&simplified_proof.mmr_root) {
+            return false;
+        }
     }
+
+    true
 }
 
 fn test_mmr_simplified(count: u32) -> Vec<SimplifiedProofTestGo> {
     let peaks = get_peaks(leaf_index_to_mmr_size(count as u64 - 1));
     let mut simplified_proof_test_data = vec![];
     println!("Peaks: {:?}", peaks);
+    println!("Leaves:");
     let store = MemStore::default();
     let mut mmr = MMR::<_, MergeNumberHash, _>::new(0, &store);
     let _positions: Vec<u64> = (0u32..count)
-        .map(|i| mmr.push(NumberHash::from(i)).unwrap())
+        .map(|i| {
+            let hash = NumberHash::from(i);
+            println!("0x{}", hex_string(&hash.0).unwrap());
+            mmr.push(hash).unwrap()
+        })
         .collect();
     let root = mmr.get_root().expect("get root");
+
+
+    // // "_beefyMMRLeafIndex": 70,
+    // //     "_beefyLeafCount": 73,
+    // //     "_beefyMMRProof": [
+    // //"0xa244ae2c1d1ad04bbb307ce418d84980aa656c6818516f019364df29c1a37224",
+    // //"0x1acbd16b3dab0a66914fbff7cbaa15f2c4a37db6d3552ff1a466cc51cb2cbb8b",
+    // //"0x58059c5ee4970ecc8491209c64dae9b5b850dce7e983bcf982079a6423d74ef4",
+    // //"0x6aafdb1600e3233eb7cf374a438b64a11e8387b9cd0145557634c013e670c9c8",
+    // //"0xee29f67540b840ec61825261182b7a8e73d1a1e548271b18e619ea87e0d1963e"
+    //  //    ]
+    // let proof_items_string = vec!["a244ae2c1d1ad04bbb307ce418d84980aa656c6818516f019364df29c1a37224",
+    //                               "1acbd16b3dab0a66914fbff7cbaa15f2c4a37db6d3552ff1a466cc51cb2cbb8b",
+    //                               "58059c5ee4970ecc8491209c64dae9b5b850dce7e983bcf982079a6423d74ef4",
+    //                               "6aafdb1600e3233eb7cf374a438b64a11e8387b9cd0145557634c013e670c9c8",
+    //                               "ee29f67540b840ec61825261182b7a8e73d1a1e548271b18e619ea87e0d1963e"];
+    // let proof_items: Vec<NumberHash> = proof_items_string.iter().map(|x| {
+    //    let input_bytes = x.as_bytes();
+    //     NumberHash(Bytes::from(decode(input_bytes).unwrap()))
+    // }).collect();
+    //
+    // let leaf_input_bytes = "9b0e63ce0de444dd57fac7701e4d333a1dd810b2aea6ca895235f8929125adc1";
+    // let mut leaf: Vec<u8> = decode(leaf_input_bytes).unwrap();
+    //
+    // let h = calculate_merkle_root_in_solidity(NumberHash(Bytes::from(leaf.clone())), proof_items.clone(), 14);
+    // println!("h is: {}", hex_string(&*h.0.to_vec()).unwrap());
+    //
+    // let proof_items_string = vec!["ee29f67540b840ec61825261182b7a8e73d1a1e548271b18e619ea87e0d1963e",
+    //                               "a244ae2c1d1ad04bbb307ce418d84980aa656c6818516f019364df29c1a37224",
+    //                               "1acbd16b3dab0a66914fbff7cbaa15f2c4a37db6d3552ff1a466cc51cb2cbb8b",
+    //                               "58059c5ee4970ecc8491209c64dae9b5b850dce7e983bcf982079a6423d74ef4",
+    //                               "6aafdb1600e3233eb7cf374a438b64a11e8387b9cd0145557634c013e670c9c8"];
+    // let proof_items: Vec<NumberHash> = proof_items_string.iter().map(|x| {
+    //     let input_bytes = x.as_bytes();
+    //     NumberHash(Bytes::from(decode(input_bytes).unwrap()))
+    // }).collect();
+    //
+    // let leaf_input_bytes = "9b0e63ce0de444dd57fac7701e4d333a1dd810b2aea6ca895235f8929125adc1";
+    // let mut leaf: Vec<u8> = decode(leaf_input_bytes).unwrap();
+    //
+    // let root_input_bytes = "e629bdf7e7cdbc80579960b549ff94b66e43f911b10e9e2b56da64d767e3d0f4";
+    // let mut test_root = decode(root_input_bytes).unwrap();
+    //
+    // let calculated_root_bytes = "746c8981b23e7e9525a8084adfe2fe05600c789fe373787308afd188e2972244";
+    // let mut calculated_root: Vec<u8> = decode(calculated_root_bytes).unwrap();
+    //
+    // let ref_proof: MerkleProof<NumberHash, MergeNumberHash> = MerkleProof::new(leaf_index_to_mmr_size(73 - 1), proof_items.clone());
+    // let ref_root = ref_proof.calculate_root(vec![(leaf_index_to_pos(70), NumberHash(Bytes::from(leaf.clone())))]).unwrap();
+    // println!("Calculated root is: {:?}", hex_string(&*ref_root.0.to_vec()).unwrap());
+    //
+    // let ref_output = ref_proof.verify(NumberHash(Bytes::from(test_root.clone())), vec![(leaf_index_to_pos(70), NumberHash(Bytes::from(leaf.clone())))]).clone();
+    // let output = ref_proof.verify(NumberHash(Bytes::from(calculated_root.clone())), vec![(leaf_index_to_pos(70), NumberHash(Bytes::from(leaf.clone())))]).clone();
+    // println!("Output from ref proof is: {:?}", ref_output);
+    // println!("Output from calculated proof is: {:?}", output);
+    //
+    // let simplified_proof = convert_to_simplified_proof(
+    //     leaf_index_to_mmr_size(73 - 1),
+    //     NumberHash(Bytes::from(test_root.clone())),
+    //     proof_items.clone(),
+    //     (leaf_index_to_pos(71), NumberHash(Bytes::from(leaf.clone()))),
+    // );
 
     for i in 0u32..count {
         let proof = mmr
@@ -360,6 +478,8 @@ fn test_mmr_simplified(count: u32) -> Vec<SimplifiedProofTestGo> {
         );
 
         let simplified_proof_in_go = simplified_proof.convert_to_go_proof();
+        let simplified_merkle_proof_order = simplified_proof_in_go.simplified_merkle_proof_order;
+        let simplified_merkle_proof_items = simplified_proof_in_go.simplified_merkle_proof_items.clone();
         simplified_proof_test_data.push(SimplifiedProofTestGo {
             reference_simplified_proof: simplified_proof_in_go,
             leaf_hash: NumberHash::from(i).0.to_vec(),
@@ -372,9 +492,23 @@ fn test_mmr_simplified(count: u32) -> Vec<SimplifiedProofTestGo> {
                 .iter()
                 .map(|x| x.0.to_vec())
                 .collect(),
+            simplified_merkle_proof_items,
+            simplified_merkle_proof_order
         });
 
-        verify_simplified_proof(simplified_proof);
+        // Testing for invalid leaf
+        assert!(!is_valid_simplified_proof(SimplifiedProof{
+            merkle_proof_items: simplified_proof.merkle_proof_items.clone(),
+            merkle_proof_order: simplified_proof.merkle_proof_order,
+            leave: Default::default(),
+            mmr_right_bagged_peak: simplified_proof.mmr_right_bagged_peak.clone(),
+            rest_of_the_peaks: simplified_proof.rest_of_the_peaks.clone(),
+            mmr_root: simplified_proof.mmr_root.clone(),
+            simplified_merkle_proof_items: simplified_proof.simplified_merkle_proof_items.clone(),
+            simplified_merkle_proof_order
+        }));
+
+        assert!(is_valid_simplified_proof(simplified_proof));
     }
 
     simplified_proof_test_data
@@ -389,6 +523,7 @@ fn test_simplified_mmr() {
     let mut go_test_data = test_mmr_simplified(1);
     go_test_data.extend(test_mmr_simplified(2));
     go_test_data.extend(test_mmr_simplified(5));
+    go_test_data.extend(test_mmr_simplified(7));
     go_test_data.extend(test_mmr_simplified(15));
     go_test_data.extend(test_mmr_simplified(60));
 
